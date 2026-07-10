@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "typhoon-preview",
+      "runtimeExecutable": "npx",
+      "runtimeArgs": ["serve", "weather-monitoring-web/dist", "-p", "4173", "-s"],
+      "port": 4173
+    }
+  ]
+}
