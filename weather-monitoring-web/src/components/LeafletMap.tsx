@@ -2,7 +2,6 @@ import React, { useEffect, useState, useRef } from 'react';
 import { MapContainer, TileLayer, useMap, Marker, Popup, Polyline, CircleMarker, Tooltip } from 'react-leaflet';
 import L from 'leaflet';
 
-// Fix default marker icon issue with bundlers
 import iconUrl from 'leaflet/dist/images/marker-icon.png';
 import iconRetinaUrl from 'leaflet/dist/images/marker-icon-2x.png';
 import shadowUrl from 'leaflet/dist/images/marker-shadow.png';
@@ -11,283 +10,213 @@ import shadowUrl from 'leaflet/dist/images/marker-shadow.png';
 delete (L.Icon.Default.prototype as any)._getIconUrl;
 L.Icon.Default.mergeOptions({ iconUrl, iconRetinaUrl, shadowUrl });
 
-const typhoonIcon = L.divIcon({
-  className: 'typhoon-marker',
-  html: '<div style="font-size:28px;filter:drop-shadow(0 0 6px red)">🌀</div>',
-  iconSize: [36, 36],
-  iconAnchor: [18, 18],
-});
+// ── Marker factory ────────────────────────────────────────────────────
+const makeCircle = (letter: string, color: string, size: number) =>
+  L.divIcon({
+    className: '',
+    html: `<div style="
+      width:${size}px;height:${size}px;border-radius:50%;
+      background:${color};color:#fff;display:flex;align-items:center;justify-content:center;
+      font-size:${size * 0.5}px;font-weight:700;font-family:Inter,sans-serif;
+      box-shadow:0 0 8px ${color}88;border:2px solid #fff3;
+    ">${letter}</div>`,
+    iconSize: [size, size], iconAnchor: [size / 2, size / 2],
+  });
 
-const currentTyphoonIcon = L.divIcon({
-  className: 'typhoon-marker-current',
-  html: '<div style="font-size:40px;filter:drop-shadow(0 0 12px #ff0000);animation:pulse 1s infinite">🌀</div>',
-  iconSize: [48, 48],
-  iconAnchor: [24, 24],
-});
+const fcIcons: Record<string, L.DivIcon> = {
+  hospital:  makeCircle('H', '#f87171', 28),
+  safezone:  makeCircle('S', '#4ade80', 28),
+  transit:   makeCircle('T', '#38bdf8', 28),
+  landmark:  makeCircle('L', '#fbbf24', 28),
+  bridge:    makeCircle('B', '#a78bfa', 28),
+};
 
-const shelterIcon = L.divIcon({
-  className: 'shelter-marker',
-  html: '<div style="font-size:24px;filter:drop-shadow(0 0 4px #10b981)">🏥</div>',
-  iconSize: [32, 32],
-  iconAnchor: [16, 16],
-});
+const typhoonIcons = {
+  past:    makeCircle('T', '#ef4444', 34),
+  current: makeCircle('T', '#ef4444', 48),
+  future:  makeCircle('T', '#f97316', 28),
+};
 
-interface TyphoonPoint {
-  lat: number;
-  lon: number;
-  time: string;
-  cat: string;
-  wind: number;
-  pressure: number;
-  label: string;
-}
+const makeRiskDot = (color: string) =>
+  L.divIcon({
+    className: '',
+    html: `<div style="width:12px;height:12px;border-radius:50%;background:${color};border:2px solid #fff5;box-shadow:0 0 5px ${color}88;"></div>`,
+    iconSize: [12, 12], iconAnchor: [6, 6],
+  });
 
-interface Shelter {
-  name: string;
-  lat: number;
-  lon: number;
-  addr: string;
-  capacity: string;
-}
+const riskIcons: Record<string, L.DivIcon> = {
+  extreme: makeRiskDot('#ef4444'),
+  high:    makeRiskDot('#f97316'),
+  medium:  makeRiskDot('#f59e0b'),
+  low:     makeRiskDot('#6b7280'),
+};
 
-// Helper component that adds a RainViewer TileLayer and cycles frames for simple animation
+// ── Types ─────────────────────────────────────────────────────────────
+interface TyphoonPoint { lat: number; lon: number; time: string; cat: string; wind: number; pressure: number; label: string; }
+interface Facility { name: string; lat: number; lon: number; addr: string; info: string; category: string; phone?: string; }
+interface ImpactZone { name: string; lat: number; lon: number; type: string; risk: string; note: string; }
+
+const FC_LABELS: Record<string, string> = {
+  hospital: 'Hospital', safezone: 'Safe Zone', transit: 'Transit Hub',
+  landmark: 'Landmark', bridge: 'Bridge / Tunnel',
+};
+
+// ── RainViewer ────────────────────────────────────────────────────────
 const RainViewerOverlay: React.FC<{ enabled: boolean }> = ({ enabled }) => {
   const map = useMap();
-  const layerRef = useRef<any>(null);
-  const [frames, setFrames] = useState<number[]>([]);
+  const layerRef = useRef<L.TileLayer | null>(null);
+  const [frames, setFrames] = useState<{ path: string }[]>([]);
   const [idx, setIdx] = useState(0);
 
   useEffect(() => {
-    let cancelled = false;
-    fetch('https://api.rainviewer.com/public/maps.json')
-      .then((r) => r.json())
-      .then((data) => {
-        if (cancelled) return;
-        const f = data.radar && data.radar.past ? data.radar.past.map((p: any) => p.time) : [];
-        setFrames(f);
-      })
-      .catch(() => {});
-    return () => {
-      cancelled = true;
-    };
+    let c = false;
+    fetch('https://api.rainviewer.com/public/weather-maps.json')
+      .then(r => r.json()).then(d => {
+        if (c) return;
+        setFrames([...(d.radar?.past || []), ...(d.radar?.nowcast || [])].map((p: any) => ({ path: p.path })));
+      }).catch(() => {});
+    return () => { c = true; };
   }, []);
 
   useEffect(() => {
-    if (!enabled) {
-      if (layerRef.current) {
-        map.removeLayer(layerRef.current);
-        layerRef.current = null;
-      }
-      return;
-    }
-    if (!frames.length) return;
-    const t = frames[idx];
-    const url = `https://tilecache.rainviewer.com/v2/radar/${t}/256/{z}/{x}/{y}/2/1_1.png`;
-    if (!L) return;
-    if (layerRef.current) map.removeLayer(layerRef.current);
-    layerRef.current = L.tileLayer(url, { opacity: 0.6, pane: 'overlayPane' });
-    layerRef.current.addTo(map);
-
-    const id = setInterval(() => {
-      setIdx((i) => (i + 1) % frames.length);
-    }, 800);
-    return () => {
-      clearInterval(id);
-      if (layerRef.current) {
-        map.removeLayer(layerRef.current);
-        layerRef.current = null;
-      }
-    };
+    if (layerRef.current) { map.removeLayer(layerRef.current); layerRef.current = null; }
+    if (!enabled || !frames.length) return;
+    layerRef.current = L.tileLayer(`https://tilecache.rainviewer.com${frames[idx].path}/256/{z}/{x}/{y}/2/1_1.png`, { opacity: 0.5, pane: 'overlayPane' }).addTo(map);
+    const t = setInterval(() => setIdx(i => (i + 1) % frames.length), 600);
+    return () => { clearInterval(t); if (layerRef.current) { map.removeLayer(layerRef.current); layerRef.current = null; } };
   }, [enabled, frames, idx, map]);
 
   return null;
 };
 
-// Inner map component that handles bounds
-const MapInner: React.FC<{
+// ── Inner map ─────────────────────────────────────────────────────────
+interface MapInnerProps {
   center?: { lat: number; lon: number } | null;
   bbox?: { south: number; north: number; west: number; east: number } | null;
   typhoonTrack?: TyphoonPoint[];
-  shelters?: Shelter[];
+  showTrackOnly?: boolean;
+  showFacilitiesOnly?: boolean;
+  facilities?: Facility[];
+  impactZones?: ImpactZone[];
   onPointClick?: (p: TyphoonPoint) => void;
-}> = ({ center, bbox, typhoonTrack, shelters, onPointClick }) => {
+}
+
+const MapInner: React.FC<MapInnerProps> = ({ center, bbox, typhoonTrack, showTrackOnly, showFacilitiesOnly, facilities, impactZones, onPointClick }) => {
   const map = useMap();
 
   useEffect(() => {
     if (!map) return;
-    if (bbox) {
-      try {
-        const sw: [number, number] = [bbox.south, bbox.west];
-        const ne: [number, number] = [bbox.north, bbox.east];
-        map.fitBounds([sw, ne], { padding: [30, 30] });
-      } catch (e) {}
-    } else if (center) {
-      try {
-        map.setView([center.lat, center.lon], 6);
-      } catch (e) {}
-    }
+    if (bbox) { try { map.fitBounds([[bbox.south, bbox.west], [bbox.north, bbox.east]], { padding: [15, 15], animate: true }); } catch {} }
+    else if (center) { try { map.setView([center.lat, center.lon], 10, { animate: true }); } catch {} }
   }, [center, bbox, map]);
 
-  const trackPositions: [number, number][] = typhoonTrack
-    ? typhoonTrack.map((p) => [p.lat, p.lon] as [number, number])
-    : [];
+  const trackPos: [number, number][] = (typhoonTrack || []).map(p => [p.lat, p.lon]);
+  const curIdx = typhoonTrack?.findIndex(p => p.label?.includes('Current')) ?? 5;
 
   return (
     <>
-      <TileLayer
-        attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
-        url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
-      />
+      <TileLayer attribution='&copy; <a href="https://carto.com/">CARTO</a>' url="https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png" />
 
-      {/* Typhoon track line */}
-      {trackPositions.length > 1 && (
-        <Polyline
-          positions={trackPositions}
-          pathOptions={{
-            color: '#ff4444',
-            weight: 3,
-            dashArray: '10 5',
-            opacity: 0.8,
-          }}
-        />
+      {/* Typhoon track */}
+      {typhoonTrack && !showFacilitiesOnly && (
+        <>
+          {trackPos.slice(0, curIdx + 1).length > 1 && (
+            <Polyline positions={trackPos.slice(0, curIdx + 1)} pathOptions={{ color: '#ef4444', weight: 3.5, opacity: 0.9 }} />
+          )}
+          {trackPos.slice(curIdx).length > 1 && (
+            <Polyline positions={trackPos.slice(curIdx)} pathOptions={{ color: '#f97316', weight: 2.5, dashArray: '8 8', opacity: 0.7 }} />
+          )}
+          {typhoonTrack.map((pt, i) => {
+            if (i !== curIdx) return null;
+            return (
+              <React.Fragment key={`zone-${i}`}>
+                <CircleMarker center={[pt.lat, pt.lon]} radius={pt.wind * 0.7} pathOptions={{ color: 'rgba(239,68,68,0.06)', fillColor: 'rgba(239,68,68,0.03)', fillOpacity: 0.3, weight: 1 }} />
+                <CircleMarker center={[pt.lat, pt.lon]} radius={pt.wind * 0.35} pathOptions={{ color: 'rgba(239,68,68,0.12)', fillColor: 'rgba(239,68,68,0.05)', fillOpacity: 0.3, weight: 1 }} />
+              </React.Fragment>
+            );
+          })}
+          {typhoonTrack.map((pt, i) => {
+            const isC = i === curIdx, isP = i <= curIdx;
+            const ic = isC ? typhoonIcons.current : isP ? typhoonIcons.past : typhoonIcons.future;
+            return (
+              <Marker key={`tp-${i}`} position={[pt.lat, pt.lon]} icon={ic} eventHandlers={{ click: () => onPointClick?.(pt) }}>
+                <Popup>
+                  <div style={{ fontSize: 12, lineHeight: 1.7, fontFamily: 'inherit' }}>
+                    <strong>{pt.time}</strong><br />
+                    Category: <span style={{ color: '#f87171', fontWeight: 600 }}>{pt.cat}</span><br />
+                    Wind: {pt.wind} km/h | Pressure: {pt.pressure} hPa<br />
+                    {pt.label && <span style={{ color: '#fbbf24' }}>{pt.label}</span>}
+                  </div>
+                </Popup>
+                <Tooltip direction="top" offset={[0, -18]} opacity={0.9}>
+                  <span style={{ fontSize: 11 }}>{pt.time} / {pt.cat}</span>
+                </Tooltip>
+              </Marker>
+            );
+          })}
+        </>
       )}
 
-      {/* Future track (dashed) */}
-      {typhoonTrack && typhoonTrack.length > 5 && (
-        <Polyline
-          positions={typhoonTrack.slice(5).map((p) => [p.lat, p.lon] as [number, number])}
-          pathOptions={{
-            color: '#ffaa00',
-            weight: 2,
-            dashArray: '5 10',
-            opacity: 0.6,
-          }}
-        />
-      )}
-
-      {/* Typhoon points */}
-      {typhoonTrack?.map((point, i) => {
-        const isCurrent = point.label.includes('当前');
-        const isPast = i <= 5;
+      {/* Facilities */}
+      {facilities && !showTrackOnly && facilities.map((f, i) => {
+        const ic = fcIcons[f.category] || fcIcons.hospital;
+        const lb = FC_LABELS[f.category] || f.category;
         return (
-          <Marker
-            key={`typhoon-${i}`}
-            position={[point.lat, point.lon]}
-            icon={isCurrent ? currentTyphoonIcon : typhoonIcon}
-            eventHandlers={{
-              click: () => onPointClick?.(point),
-            }}
-          >
+          <Marker key={`fac-${i}`} position={[f.lat, f.lon]} icon={ic}>
             <Popup>
-              <div style={{ fontSize: 13, lineHeight: 1.6 }}>
-                <strong>{point.time}</strong><br />
-                等级: <span style={{ color: '#ff4444' }}>{point.cat}</span><br />
-                风速: {point.wind} km/h<br />
-                气压: {point.pressure} hPa<br />
-                {point.label && <span style={{ color: '#f59e0b' }}>⚠️ {point.label}</span>}
+              <div style={{ fontSize: 12, lineHeight: 1.6, fontFamily: 'inherit', minWidth: 180 }}>
+                <strong>{f.name}</strong><br />
+                <span style={{ color: '#9ca3af' }}>{f.addr}</span><br />
+                <span style={{ fontSize: 11 }}>{lb} / {f.info}</span><br />
+                {f.phone && <span style={{ fontSize: 11 }}>Tel: {f.phone}</span>}
+                <br /><a href={`https://www.google.com/maps/dir/?api=1&destination=${f.lat},${f.lon}`} target="_blank" rel="noopener noreferrer" style={{ color: '#38bdf8', fontSize: 12, fontWeight: 500 }}>Navigate (Google Maps)</a>
               </div>
             </Popup>
-            <Tooltip direction="top" offset={[0, -20]}>
-              <span style={{ fontSize: 11 }}>
-                {point.time} {point.cat}
-              </span>
-            </Tooltip>
           </Marker>
         );
       })}
 
-      {/* Radius circles for danger zone around current position */}
-      {typhoonTrack?.map((point, i) => {
-        if (!point.label.includes('当前')) return null;
+      {/* Impact zones */}
+      {impactZones && !showTrackOnly && impactZones.map((z, i) => {
+        const ic = riskIcons[z.risk] || riskIcons.medium;
         return (
-          <React.Fragment key={`zone-${i}`}>
-            <CircleMarker
-              center={[point.lat, point.lon]}
-              radius={point.wind * 0.8}
-              pathOptions={{
-                color: 'rgba(255,0,0,0.15)',
-                fillColor: 'rgba(255,0,0,0.05)',
-                fillOpacity: 0.3,
-                weight: 1,
-              }}
-            />
-          </React.Fragment>
+          <Marker key={`imp-${i}`} position={[z.lat, z.lon]} icon={ic} opacity={0.8}>
+            <Popup>
+              <div style={{ fontSize: 12, lineHeight: 1.6, fontFamily: 'inherit', minWidth: 180 }}>
+                <strong>{z.name}</strong><br />
+                <span style={{ color: '#9ca3af' }}>Type: {z.type} | Risk: </span>
+                <span style={{ color: z.risk === 'extreme' ? '#f87171' : z.risk === 'high' ? '#f97316' : '#fbbf24', fontWeight: 600 }}>{z.risk}</span><br />
+                <span style={{ fontSize: 11 }}>{z.note}</span>
+              </div>
+            </Popup>
+            <Tooltip direction="top" offset={[0, -8]} opacity={0.9}><span style={{ fontSize: 10 }}>{z.name}</span></Tooltip>
+          </Marker>
         );
       })}
-
-      {/* Shelters */}
-      {shelters?.map((s, i) => (
-        <Marker
-          key={`shelter-${i}`}
-          position={[s.lat, s.lon]}
-          icon={shelterIcon}
-        >
-          <Popup>
-            <div style={{ fontSize: 13, lineHeight: 1.6 }}>
-              <strong>🏥 {s.name}</strong><br />
-              📍 {s.addr}<br />
-              👥 {s.capacity}<br />
-              <a
-                href={`https://www.google.com/maps/dir/?api=1&destination=${s.lat},${s.lon}`}
-                target="_blank"
-                rel="noopener noreferrer"
-                style={{ color: '#10b981' }}
-              >
-                🧭 导航到此
-              </a>
-            </div>
-          </Popup>
-        </Marker>
-      ))}
     </>
   );
 };
 
+// ── LeafletMap ────────────────────────────────────────────────────────
 interface LeafletMapProps {
   center?: { lat: number; lon: number } | null;
   bbox?: { south: number; north: number; west: number; east: number } | null;
   typhoonTrack?: TyphoonPoint[];
-  shelters?: Shelter[];
+  showRadar?: boolean;
+  showTrackOnly?: boolean;
+  showFacilitiesOnly?: boolean;
+  facilities?: Facility[];
+  impactZones?: ImpactZone[];
   onPointClick?: (p: TyphoonPoint) => void;
 }
 
-const LeafletMap: React.FC<LeafletMapProps> = ({
-  center = null,
-  bbox = null,
-  typhoonTrack,
-  shelters,
-  onPointClick,
-}) => {
-  const [showRadar, setShowRadar] = useState(true);
-
+const LeafletMap: React.FC<LeafletMapProps> = (props) => {
+  const { center } = props;
   return (
-    <div style={{ height: '100%', position: 'relative' }}>
-      <div style={{ position: 'absolute', top: 8, right: 8, zIndex: 1000, background: 'rgba(0,0,0,0.7)', padding: '6px 10px', borderRadius: 6 }}>
-        <label style={{ color: '#cbd5e1', fontSize: 12, cursor: 'pointer' }}>
-          <input
-            type="checkbox"
-            checked={showRadar}
-            onChange={(e) => setShowRadar(e.target.checked)}
-            style={{ marginRight: 4 }}
-          />
-          降雨雷达
-        </label>
-      </div>
-      <MapContainer
-        center={center ? [center.lat, center.lon] : [25, 122]}
-        zoom={6}
-        style={{ height: '100%', width: '100%' }}
-      >
-        <MapInner
-          center={center}
-          bbox={bbox}
-          typhoonTrack={typhoonTrack}
-          shelters={shelters}
-          onPointClick={onPointClick}
-        />
-        <RainViewerOverlay enabled={showRadar} />
-      </MapContainer>
-    </div>
+    <MapContainer center={center ? [center.lat, center.lon] : [31.23, 121.47]} zoom={10} style={{ height: '100%', width: '100%' }} zoomControl={true}>
+      <MapInner {...props} />
+      <RainViewerOverlay enabled={props.showRadar ?? false} />
+    </MapContainer>
   );
 };
 
